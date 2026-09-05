@@ -9,7 +9,12 @@ from socketserver import ThreadingMixIn
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .tools import (
+    messages_to_prompt, parse_tool_calls, google_contents_to_prompt,
+    parse_google_function_calls, parse_google_calls_as_tool_calls,
+    extract_openai_tool_defs, extract_google_tool_defs,
+    generate_validated, StreamToolCallParser, validate_tool_arguments,
+)
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from .agent import run_agent_loop
 from . import __version__
@@ -19,6 +24,30 @@ def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _openai_tool_event_chunks(cid: str, created: int, model_name: str, event: tuple, call_ids: dict) -> list:
+    """Convert a StreamToolCallParser event into OpenAI streaming chunk dicts.
+
+    call_ids maps parser tool index -> generated call id (assigned on tool_start).
+    Returns a list (possibly empty) of chunk payloads.
+    """
+    kind = event[0]
+    base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name}
+    if kind == "text":
+        delta = {"content": event[1]}
+    elif kind == "tool_start":
+        _, idx, name = event
+        call_id = f"call_{uuid.uuid4().hex[:8]}"
+        call_ids[idx] = call_id
+        delta = {"tool_calls": [{"index": idx, "id": call_id, "type": "function",
+                                 "function": {"name": name, "arguments": ""}}]}
+    elif kind == "tool_args":
+        _, idx, args_json = event
+        delta = {"tool_calls": [{"index": idx, "function": {"arguments": args_json}}]}
+    else:  # tool_end: nothing to emit for OpenAI
+        return []
+    return [{**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}]
 
 
 def _upload_images(images: list) -> list:
@@ -140,7 +169,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif self.path in ("/", "/health"):
+                # /health est l'endpoint léger utilisé par le keepalive Render
+                # et les sondes UptimeRobot/cron. Pas d'auth, réponse < 1KB.
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -157,6 +188,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
+            elif self.path == "/v1/messages":
+                self._handle_anthropic(body)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
@@ -188,6 +221,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
         messages = req.get("messages", [])
+        tool_defs = extract_openai_tool_defs(tools) if tools and tool_choice != "none" else []
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
@@ -202,7 +236,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         executor_url = req.get("tool_executor_url")
-        if executor_url and tools and tool_choice != "none":
+        if executor_url and tool_defs:
             # Agent mode: the server runs the full model <-> tool loop via the
             # executor webhook and returns the final answer like a normal call.
             try:
@@ -238,13 +272,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 })
             return
 
-        if stream and (not tools or tool_choice == "none"):
+        include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
+        created = int(time.time())
+
+        if stream and not tool_defs:
             try:
                 self._start_sse()
                 first_chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
-                    "created": int(time.time()),
+                    "created": created,
                     "model": model_name,
                     "choices": [{
                         "index": 0,
@@ -254,14 +291,72 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
+                full_text = []
                 for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
-                end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                    full_text.append(delta)
+                end = {"id": cid, "object": "chat.completion.chunk", "created": created,
                        "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
+                if include_usage:
+                    usage_chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                                   "model": model_name, "choices": [],
+                                   "usage": _usage(prompt, "".join(full_text))}
+                    self.wfile.write(f"data: {json.dumps(usage_chunk)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Stream error: {e}")
+            return
+
+        if stream and tool_defs:
+            # Real-time streaming with tool calls: text is forwarded as it
+            # arrives, tool_call deltas are emitted as soon as each block is
+            # recognized (no buffering of the full response).
+            try:
+                self._start_sse()
+                first_chunk = {
+                    "id": cid, "object": "chat.completion.chunk", "created": created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                }
+                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
+                self.wfile.flush()
+                parser = StreamToolCallParser()
+                call_ids = {}
+                out_chars = 0
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                    for event in parser.feed(delta):
+                        if event[0] == "text":
+                            out_chars += len(event[1])
+                        elif event[0] == "tool_args":
+                            out_chars += len(event[2])
+                        for chunk in _openai_tool_event_chunks(cid, created, model_name, event, call_ids):
+                            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                for event in parser.finish():
+                    if event[0] == "text":
+                        out_chars += len(event[1])
+                    elif event[0] == "tool_args":
+                        out_chars += len(event[2])
+                    for chunk in _openai_tool_event_chunks(cid, created, model_name, event, call_ids):
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                finish = "tool_calls" if parser.tool_count else "stop"
+                end = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+                self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
+                if include_usage:
+                    usage_chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                                   "model": model_name, "choices": [],
+                                   "usage": {"prompt_tokens": len(prompt) // 4,
+                                             "completion_tokens": out_chars // 4,
+                                             "total_tokens": (len(prompt) + out_chars) // 4}}
+                    self.wfile.write(f"data: {json.dumps(usage_chunk)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -271,14 +366,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text, tool_calls = generate_validated(
+                prompt, tool_defs, tool_choice, generate,
+                model_id, think_mode, file_refs, extra_fields,
+            )
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        tool_calls = None
-        if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -286,14 +381,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+            if include_usage:
+                usage_chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                               "model": model_name, "choices": [],
+                               "usage": _usage(prompt, text or "")}
+                self.wfile.write(f"data: {json.dumps(usage_chunk)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
             self.send_json({
-                "id": cid, "object": "chat.completion", "created": int(time.time()),
+                "id": cid, "object": "chat.completion", "created": created,
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                 "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
@@ -362,9 +462,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        tool_defs = extract_openai_tool_defs(tools) if tools and tool_choice != "none" else []
         agent_steps = []
         executor_url = req.get("tool_executor_url")
-        agent_mode = bool(executor_url) and bool(tools) and tool_choice != "none"
+        agent_mode = bool(executor_url) and bool(tool_defs)
         try:
             file_refs = _upload_images(images)
             if agent_mode:
@@ -373,14 +474,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     model_id, think_mode, extra_fields, file_refs,
                 )
             else:
-                text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+                text, tool_calls = generate_validated(
+                    prompt, tool_defs, tool_choice, generate,
+                    model_id, think_mode, file_refs, extra_fields,
+                )
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
-
-        tool_calls = None
-        if tools and text and tool_choice != "none" and not agent_mode:
-            text, tool_calls = parse_tool_calls(text)
+        if agent_mode:
+            tool_calls = None
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -550,9 +652,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
-        tool_config = req.get("toolConfig", {})
-        fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
-        has_tools = bool(req.get("tools")) and fc_mode != "NONE"
+        tool_defs = extract_google_tool_defs(req)
+        has_tools = bool(tool_defs)
         prompt, images = google_contents_to_prompt(req)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
@@ -596,25 +697,88 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Google stream error: {e}")
             return
 
+        if stream and has_tools:
+            # Streaming with function calls: text deltas stream as they arrive;
+            # each completed function_call block is emitted as one full part
+            # (Google protocol expects complete args in a single functionCall).
+            try:
+                self._start_sse()
+                parser = StreamToolCallParser()
+                out_chars = 0
+                pending_calls = {}  # parser index -> {"name":..., "args": dict}
+
+                def _write(obj):
+                    self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+
+                def _handle_event(event):
+                    nonlocal out_chars
+                    kind = event[0]
+                    if kind == "text":
+                        out_chars += len(event[1])
+                        _write({"candidates": [{"content": {"parts": [{"text": event[1]}], "role": "model"}, "index": 0}],
+                                "modelVersion": model_name})
+                    elif kind == "tool_start":
+                        pending_calls[event[1]] = {"name": event[2], "args": {}}
+                    elif kind == "tool_args":
+                        out_chars += len(event[2])
+                        try:
+                            pending_calls[event[1]]["args"] = json.loads(event[2])
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    elif kind == "tool_end":
+                        call = pending_calls.pop(event[1], None)
+                        if call:
+                            _write({"candidates": [{"content": {
+                                "parts": [{"functionCall": {"name": call["name"], "args": call["args"]}}],
+                                "role": "model"}, "index": 0}],
+                                "modelVersion": model_name})
+
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                    for event in parser.feed(delta):
+                        _handle_event(event)
+                    self.wfile.flush()
+                for event in parser.finish():
+                    _handle_event(event)
+                final_chunk = {
+                    "candidates": [{"finishReason": "STOP", "index": 0}],
+                    "usageMetadata": {
+                        "promptTokenCount": len(prompt) // 4,
+                        "candidatesTokenCount": out_chars // 4,
+                        "totalTokenCount": (len(prompt) + out_chars) // 4,
+                    },
+                    "modelVersion": model_name,
+                }
+                _write(final_chunk)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Google stream error: {e}")
+            return
+
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text, tool_calls = generate_validated(
+                prompt, tool_defs, "auto", generate,
+                model_id, think_mode, file_refs, extra_fields,
+                parse_fn=parse_google_calls_as_tool_calls, block_format="function_call",
+            )
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        if not text:
+        if not text and not tool_calls:
             log("Warning: empty response from Gemini")
 
         response_parts = []
-        if has_tools and text:
-            clean_text, function_calls = parse_google_function_calls(text)
-            if function_calls:
-                if clean_text:
-                    response_parts.append({"text": clean_text})
-                for fc in function_calls:
-                    response_parts.append({"functionCall": {"name": fc["name"], "args": fc["args"]}})
-            else:
+        if tool_calls:
+            if text:
                 response_parts.append({"text": text})
+            for call in tool_calls:
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                response_parts.append({"functionCall": {"name": call["function"]["name"], "args": args}})
         else:
             response_parts.append({"text": text or "I apologize, but I was unable to generate a response. Please try again."})
 
@@ -640,6 +804,213 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
         else:
             self.send_json(response_obj)
+
+    # ─── /v1/messages (Anthropic-compatible) ─────────────────────────────────
+
+    def _anthropic_to_internal(self, req: dict) -> tuple:
+        """Convert an Anthropic /v1/messages request into (messages, tools, tool_choice).
+
+        messages/tools use the internal OpenAI shape so the shared prompt
+        builder and validation loop can be reused.
+        """
+        messages = []
+        system = req.get("system")
+        if system:
+            if isinstance(system, list):
+                system = " ".join(b.get("text", "") for b in system if isinstance(b, dict))
+            messages.append({"role": "system", "content": system})
+
+        for msg in req.get("messages", []):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                messages.append({"role": role, "content": content})
+                continue
+            text_parts, tool_calls, tool_results = [], [], []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text_parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    tool_calls.append({
+                        "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                        },
+                    })
+                elif btype == "tool_result":
+                    inner = block.get("content", "")
+                    if isinstance(inner, list):
+                        inner = " ".join(b.get("text", "") for b in inner if isinstance(b, dict))
+                    if not isinstance(inner, str):
+                        inner = json.dumps(inner, ensure_ascii=False)
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id", ""),
+                        "name": block.get("name", ""),
+                        "content": inner,
+                    })
+                elif btype == "image":
+                    text_parts.append("[Image attached]")
+            if tool_calls:
+                messages.append({"role": "assistant", "content": " ".join(text_parts) or None,
+                                 "tool_calls": tool_calls})
+            elif text_parts:
+                messages.append({"role": role, "content": " ".join(text_parts)})
+            for tr in tool_results:
+                messages.append(tr)
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": t.get("name", ""),
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {}),
+            },
+        } for t in req.get("tools") or [] if isinstance(t, dict) and t.get("name")]
+
+        tc = req.get("tool_choice") or {}
+        tc_type = tc.get("type", "auto") if isinstance(tc, dict) else "auto"
+        if tc_type == "none":
+            tool_choice = "none"
+        elif tc_type == "any":
+            tool_choice = "required"
+        elif tc_type == "tool" and tc.get("name"):
+            tool_choice = {"type": "function", "function": {"name": tc["name"]}}
+        else:
+            tool_choice = "auto"
+        return messages, tools, tool_choice
+
+    def _handle_anthropic(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"type": "invalid_request_error", "message": "invalid JSON"}}, 400)
+            return
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
+            req.get("model", CONFIG["default_model"]))
+        if err:
+            self.send_json({"error": {"type": "invalid_request_error", "message": err}}, 400)
+            return
+
+        messages, tools, tool_choice = self._anthropic_to_internal(req)
+        tool_defs = extract_openai_tool_defs(tools) if tools and tool_choice != "none" else []
+        prompt, images = messages_to_prompt(messages, tools or None, tool_choice)
+        if not prompt.strip():
+            self.send_json({"error": {"type": "invalid_request_error", "message": "empty content"}}, 400)
+            return
+
+        try:
+            file_refs = _upload_images(images)
+        except RuntimeError as e:
+            self.send_json({"error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            return
+        log(f"Anthropic API: model={model_name} stream={req.get('stream')} tools={bool(tool_defs)} prompt_len={len(prompt)}")
+
+        mid = f"msg_{uuid.uuid4().hex[:16]}"
+
+        if req.get("stream"):
+            self._start_sse()
+
+            def _emit(event_type, payload):
+                self.wfile.write(f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+
+            _emit("message_start", {"type": "message_start", "message": {
+                "id": mid, "type": "message", "role": "assistant", "model": model_name,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": len(prompt) // 4, "output_tokens": 0},
+            }})
+            parser = StreamToolCallParser()
+            block_index = -1
+            text_open = False
+            tool_ids = {}
+            out_chars = 0
+            for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for event in parser.feed(delta):
+                    kind = event[0]
+                    if kind == "text":
+                        out_chars += len(event[1])
+                        if not text_open:
+                            block_index += 1
+                            text_open = True
+                            _emit("content_block_start", {"type": "content_block_start", "index": block_index,
+                                                          "content_block": {"type": "text", "text": ""}})
+                        _emit("content_block_delta", {"type": "content_block_delta", "index": block_index,
+                                                      "delta": {"type": "text_delta", "text": event[1]}})
+                    elif kind == "tool_start":
+                        if text_open:
+                            _emit("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                            text_open = False
+                        block_index += 1
+                        tool_ids[event[1]] = (block_index, f"toolu_{uuid.uuid4().hex[:16]}")
+                        bidx, call_id = tool_ids[event[1]]
+                        _emit("content_block_start", {"type": "content_block_start", "index": bidx,
+                                                      "content_block": {"type": "tool_use", "id": call_id,
+                                                                        "name": event[2], "input": {}}})
+                    elif kind == "tool_args":
+                        out_chars += len(event[2])
+                        bidx, _ = tool_ids[event[1]]
+                        _emit("content_block_delta", {"type": "content_block_delta", "index": bidx,
+                                                      "delta": {"type": "input_json_delta", "partial_json": event[2]}})
+                    elif kind == "tool_end":
+                        bidx, _ = tool_ids[event[1]]
+                        _emit("content_block_stop", {"type": "content_block_stop", "index": bidx})
+            for event in parser.finish():
+                if event[0] == "text":
+                    out_chars += len(event[1])
+                    if not text_open:
+                        block_index += 1
+                        text_open = True
+                        _emit("content_block_start", {"type": "content_block_start", "index": block_index,
+                                                      "content_block": {"type": "text", "text": ""}})
+                    _emit("content_block_delta", {"type": "content_block_delta", "index": block_index,
+                                                  "delta": {"type": "text_delta", "text": event[1]}})
+            if text_open:
+                _emit("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            stop_reason = "tool_use" if parser.tool_count else "end_turn"
+            _emit("message_delta", {"type": "message_delta",
+                                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                                    "usage": {"output_tokens": out_chars // 4}})
+            _emit("message_stop", {"type": "message_stop"})
+            self.wfile.flush()
+            return
+
+        try:
+            text, tool_calls = generate_validated(
+                prompt, tool_defs, tool_choice, generate,
+                model_id, think_mode, file_refs, extra_fields,
+            )
+        except Exception as e:
+            self.send_json({"error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            return
+
+        usage = {"input_tokens": len(prompt) // 4, "output_tokens": (len(text or "")) // 4}
+        for call in tool_calls or []:
+            usage["output_tokens"] += len(call["function"].get("arguments", "")) // 4
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+
+        def _content_blocks():
+            blocks = []
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for call in tool_calls or []:
+                try:
+                    input_obj = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    input_obj = {}
+                blocks.append({"type": "tool_use", "id": call["id"],
+                               "name": call["function"]["name"], "input": input_obj})
+            return blocks
+
+        self.send_json({
+            "id": mid, "type": "message", "role": "assistant", "model": model_name,
+            "content": _content_blocks(),
+            "stop_reason": stop_reason, "stop_sequence": None,
+            "usage": usage,
+        })
 
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):

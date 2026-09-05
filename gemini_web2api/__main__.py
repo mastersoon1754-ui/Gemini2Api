@@ -29,6 +29,27 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    # Render injecte PORT automatiquement (10000) -> respecte l'env
+    if os.environ.get("PORT"):
+        try:
+            CONFIG["port"] = int(os.environ["PORT"])
+        except ValueError:
+            pass
+
+    # Env overrides pour keepalive (permet config sans fichier)
+    if os.environ.get("KEEPALIVE_URL"):
+        CONFIG["keepalive_url"] = os.environ["KEEPALIVE_URL"]
+    if os.environ.get("KEEPALIVE_INTERVAL_SEC") or os.environ.get("KEEPALIVE_INTERVAL"):
+        try:
+            CONFIG["keepalive_interval_sec"] = int(
+                os.environ.get("KEEPALIVE_INTERVAL_SEC") or os.environ.get("KEEPALIVE_INTERVAL")
+            )
+        except ValueError:
+            pass
+    # Auto-détection Render si pas de keepalive_url explicite
+    if not CONFIG.get("keepalive_url") and os.environ.get("RENDER_EXTERNAL_URL"):
+        CONFIG["keepalive_url"] = os.environ["RENDER_EXTERNAL_URL"]
+
     new_bl = fetch_latest_bl()
     if new_bl:
         CONFIG["gemini_bl"] = new_bl
@@ -43,6 +64,16 @@ def main():
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
+    # Keepalive Render (anti-veille free tier)
+    try:
+        from .keepalive import start_keepalive
+        ka_target, ka_interval = start_keepalive()
+        if ka_target:
+            print(f"  Keepalive: {ka_target} toutes les {ka_interval}s")
+        else:
+            print(f"  Keepalive: désactivé (définis KEEPALIVE_URL ou RENDER_EXTERNAL_URL pour activer)")
+    except Exception as e:
+        print(f"  Keepalive: erreur init: {e}")
     print()
     try:
         server.serve_forever()

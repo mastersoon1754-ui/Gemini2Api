@@ -20,6 +20,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
+- **Anthropic clients**: Messages API (`/v1/messages`) for Claude-style SDKs
 
 ## Quick Start
 
@@ -296,6 +297,26 @@ Configuration:
 
 `tool_choice: "required"` is enforced: if the model refuses to call a tool,
 the loop nudges it once before returning.
+
+## Tool Calling Reliability
+
+Gemini Web has no native function calling, so the proxy translates tool
+definitions into the prompt and parses tool-call blocks from the model output.
+To make this behave like a real API for coding agents:
+
+- **Real-time streaming**: `tool_calls` deltas are emitted as soon as each
+  block is recognized (no buffering of the full response), with OpenAI-style
+  `index`/`id`/`arguments` chunks and `finish_reason: "tool_calls"`.
+- **Parallel tool calls**: multiple blocks in one response become multiple
+  `tool_calls` entries.
+- **Large toolsets**: up to `tool_max_tools` (default `96`) tools and
+  `tool_max_prompt_chars` (default `120000`) of schema JSON per prompt;
+  schemas are minified first. Core coding tools (bash/edit/read/...) are
+  prioritized if the budget is hit, and drops are logged.
+- **Validation + auto-repair**: parsed arguments are validated against each
+  tool's JSON schema. Invalid arguments trigger up to `tool_validate_retry`
+  (default `1`) transparent repair round-trips with the original context;
+  calls that stay broken are never sent to the client.
 
 ## OpenCode (coding agent with its own tools)
 

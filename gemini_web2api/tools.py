@@ -7,7 +7,110 @@ import binascii
 import io
 from urllib.parse import unquote_to_bytes
 
+from .config import CONFIG
+
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
+
+
+def _minify_schema(schema):
+    """Recursively strip schema keys that add prompt bytes without helping the
+    model follow the schema ($schema/$id/title boilerplate, redundant
+    additionalProperties)."""
+    if isinstance(schema, dict):
+        out = {}
+        for k, v in schema.items():
+            if k in ("$schema", "$id", "title"):
+                continue
+            if k == "additionalProperties" and v is False:
+                continue
+            out[k] = _minify_schema(v)
+        return out
+    if isinstance(schema, list):
+        return [_minify_schema(v) for v in schema]
+    return schema
+
+
+def extract_openai_tool_defs(tools: list) -> list:
+    """Normalize OpenAI-style tool definitions into compact dicts for the prompt.
+
+    Schema minification keeps large agent toolsets (60+ tools) within a usable
+    prompt budget without silently changing what the tools do.
+    """
+    defs = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+        name = fn.get("name", tool.get("name", ""))
+        if not name:
+            continue
+        defs.append({
+            "name": name,
+            "description": fn.get("description", tool.get("description", "")),
+            "parameters": _minify_schema(fn.get("parameters", tool.get("parameters", {})) or {}),
+        })
+    return defs
+
+
+def extract_google_tool_defs(req: dict) -> list:
+    """Extract tool definitions from a Google-native request body."""
+    defs = []
+    fc_mode = req.get("toolConfig", {}).get("functionCallingConfig", {}).get("mode", "AUTO")
+    if fc_mode == "NONE":
+        return defs
+    for tool_group in req.get("tools") or []:
+        for fn in tool_group.get("functionDeclarations", []):
+            td = {"name": fn.get("name", ""), "description": fn.get("description", "")}
+            params = fn.get("parameters") or fn.get("parametersJsonSchema")
+            if params:
+                td["parameters"] = _minify_schema(params)
+            defs.append(td)
+    return defs
+
+
+def validate_tool_arguments(args, schema, path="$") -> list:
+    """Validate parsed tool arguments against a (subset of) JSON Schema.
+
+    Checks: type, enum, required properties, and recurses into object
+    properties and array items. Returns a list of human-readable errors
+    (empty list = valid). Intentionally lenient on unknown properties.
+    """
+    errors = []
+    if not isinstance(schema, dict):
+        return errors
+    expected = schema.get("type")
+    if expected:
+        type_map = {
+            "object": dict, "array": list, "string": str,
+            "boolean": bool, "null": type(None),
+        }
+        if expected in type_map:
+            py = type_map[expected]
+            ok = isinstance(args, py) and not (py is bool and not isinstance(args, bool))
+            if expected == "boolean":
+                ok = isinstance(args, bool)
+            if not ok:
+                return [f"{path}: expected {expected}, got {type(args).__name__}"]
+        elif expected == "integer":
+            if not isinstance(args, int) or isinstance(args, bool):
+                return [f"{path}: expected integer, got {type(args).__name__}"]
+        elif expected == "number":
+            if not isinstance(args, (int, float)) or isinstance(args, bool):
+                return [f"{path}: expected number, got {type(args).__name__}"]
+    if "enum" in schema and isinstance(args, (str, int, float, bool)) and args not in schema["enum"]:
+        errors.append(f"{path}: value {args!r} not in enum {schema['enum']}")
+    if isinstance(args, dict):
+        for req_key in schema.get("required", []):
+            if req_key not in args:
+                errors.append(f"{path}: missing required property '{req_key}'")
+        props = schema.get("properties", {})
+        for k, v in args.items():
+            if k in props:
+                errors.extend(validate_tool_arguments(v, props[k], f"{path}.{k}"))
+    if isinstance(args, list) and "items" in schema:
+        for i, item in enumerate(args):
+            errors.extend(validate_tool_arguments(item, schema["items"], f"{path}[{i}]"))
+    return errors
 
 
 def _compress_b64_if_needed(b64: str) -> str:
@@ -110,19 +213,13 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     images = []
 
     if tools and tool_choice != "none":
-        tool_defs = []
-        for tool in tools:
-            fn = tool.get("function", tool) if tool.get("type") == "function" else tool
-            tool_defs.append({
-                "name": fn.get("name", tool.get("name", "")),
-                "description": fn.get("description", tool.get("description", "")),
-                "parameters": fn.get("parameters", tool.get("parameters", {})),
-            })
+        tool_defs = extract_openai_tool_defs(tools)
         if tool_defs:
-            # Prioritize core tools: clients like OpenCode send ~80 tools with
-            # MCP extras (blender/roblox) alphabetically BEFORE write/edit/read,
-            # so a naive count cap keeps the extras and chops the core tools.
+            # Budgets come from CONFIG so large agent toolsets (opencode sends
+            # ~80 tools with MCP extras) fit without silent truncation.
             # Core tools are always kept; remaining budget is filled smallest-first.
+            max_tools = int(CONFIG.get("tool_max_tools", 64))
+            max_chars = int(CONFIG.get("tool_max_prompt_chars", 120000))
             CORE_TOOLS = ("bash", "edit", "write", "read", "grep", "glob", "webfetch",
                           "question", "lsp", "task", "todowrite", "skill",
                           "list_mcp_resources", "read_mcp_resource",
@@ -143,10 +240,15 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             kept, size = [], 0
             for t in tool_defs:
                 tsize = len(json.dumps(t))
-                if len(kept) >= 25 or (kept and size + tsize > 35000):
+                if len(kept) >= max_tools or (kept and size + tsize > max_chars):
                     break
                 kept.append(t)
                 size += tsize
+            dropped = [t["name"] for t in tool_defs[len(kept):]]
+            if dropped:
+                from .gemini import log
+                log(f"Tool budget exceeded: dropped {len(dropped)} tools: {', '.join(dropped[:10])}"
+                    + ("..." if len(dropped) > 10 else ""))
             tool_defs = kept
             tool_json = json.dumps(tool_defs)  # compact block: stays under Gemini's safety thresholds
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
@@ -154,7 +256,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "When calling tools, output ONLY the tool_call block(s).\n\n"
+                "When calling tools, output ONLY the tool_call block(s).\n"
+                "Rules:\n"
+                '- To call several tools in one turn, output multiple tool_call blocks.\n'
+                '- "arguments" must be a JSON object satisfying the tool\'s parameters schema,\n'
+                '  including every "required" field.\n'
+                "- After receiving a [Tool result for ...], use that data to continue.\n\n"
                 f"Available tools:\n{tool_json}"
                 f"{constraint}"
             )
@@ -476,3 +583,305 @@ def parse_google_function_calls(text: str) -> tuple:
         except (json.JSONDecodeError, KeyError):
             pass
     return clean, function_calls
+
+
+def parse_google_calls_as_tool_calls(text: str) -> tuple:
+    """Parse Google function_call blocks and normalize to OpenAI tool_calls shape.
+
+    Returns (clean_text, [{"id", "type": "function", "function": {"name", "arguments"}}]).
+    Used so the shared validation/repair loop works for both API surfaces.
+    """
+    clean, calls = parse_google_function_calls(text)
+    normalized = []
+    for c in calls:
+        normalized.append({
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {
+                "name": c["name"],
+                "arguments": json.dumps(c.get("args", {}), ensure_ascii=False),
+            },
+        })
+    return clean, normalized
+
+
+# ─── Streaming tool-call parser ───────────────────────────────────────────────
+
+
+class StreamToolCallParser:
+    """Incremental parser that extracts fenced tool-call blocks from a
+    streamed model response in real time.
+
+    feed(chunk) returns events as soon as they are recognized:
+      ("text", str)                    - plain text to stream to the client
+      ("tool_start", index, name)      - a tool call opened, name known
+      ("tool_args", index, args_json)  - complete arguments for that call
+      ("tool_end", index)              - call finished
+
+    finish() flushes the tail: buffered text, or a truncated JSON block that
+    gets auto-closed and repaired before falling back to raw text.
+
+    Handles both ```tool_call (OpenAI surface) and ```function_call (Google
+    surface) openers, and is robust to openers/JSON split across chunks.
+    """
+
+    OPENERS = ("```tool_call", "```function_call")
+    _TAIL = max(len(o) for o in OPENERS) - 1
+
+    def __init__(self):
+        self.index = 0
+        self.pending = ""    # text-mode buffer (holds possible partial opener)
+        self.body = None     # {"buf", "scanned", "depth", "in_str", "esc"} inside a block
+        self.await_fence = False  # a block just closed: consume ``` before text
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def feed(self, chunk: str) -> list:
+        events = []
+        if self.body is not None:
+            self.body["buf"] += chunk
+            events.extend(self._drain_body())
+            if self.body is None:
+                events.extend(self._scan_text())
+            return events
+        self.pending += chunk
+        events.extend(self._scan_text())
+        return events
+
+    def finish(self) -> list:
+        events = []
+        if self.body is not None:
+            raw = self.body["buf"]
+            depth, in_str = self.body["depth"], self.body["in_str"]
+            self.body = None
+            events.extend(self._emit_tool(raw, depth, in_str))
+            self.pending = ""
+            return events
+        if self.await_fence:
+            self._consume_fence()
+            # A stream ending right at the closing fence must not leak the
+            # leftover backticks into the content text.
+            if self.await_fence and not self.pending.strip("`\r\n \t"):
+                self.pending = ""
+        if self.pending:
+            events.append(("text", self.pending))
+            self.pending = ""
+        return events
+
+    @property
+    def tool_count(self) -> int:
+        return self.index
+
+    # ── internals ─────────────────────────────────────────────────────────
+
+    def _consume_fence(self) -> bool:
+        """Consume the closing ``` (possibly split across chunks) after a block.
+
+        Returns True when text scanning may continue, False when more data is
+        needed before the decision can be made."""
+        stripped = self.pending.lstrip(" \t\r\n")
+        self.pending = stripped
+        if not stripped:
+            return False
+        if stripped.startswith("{"):
+            # Another block body follows without an opener.
+            self.await_fence = False
+            return True
+        if stripped.startswith("`"):
+            count = len(stripped) - len(stripped.lstrip("`"))
+            after_bt = stripped[count:]
+            if after_bt.startswith(("tool_call", "function_call")):
+                # Opening fence of another block: let the scanner handle it.
+                self.await_fence = False
+                return True
+            if count >= 3:
+                # Fence consumed; what follows is content text - keep it
+                # verbatim (no further whitespace stripping).
+                self.pending = stripped[3:]
+                self.await_fence = False
+                return True
+            if after_bt:
+                # 1-2 backticks followed by content: inline code, not a fence.
+                self.await_fence = False
+                return True
+            return False  # partial fence: wait for more data
+        self.await_fence = False
+        return True
+
+    def _scan_text(self) -> list:
+        events = []
+        while self.body is None:
+            if self.await_fence:
+                if self._consume_fence():
+                    continue
+                return events
+            found = None
+            for opener in self.OPENERS:
+                i = self.pending.find(opener)
+                if i != -1 and (found is None or i < found[0]):
+                    found = (i, opener)
+            if found is None:
+                safe = len(self.pending) - self._TAIL
+                if safe > 0:
+                    events.append(("text", self.pending[:safe]))
+                    self.pending = self.pending[safe:]
+                return events
+            i, opener = found
+            events.append(("text", self.pending[:i]))
+            rest = self.pending[i + len(opener):]
+            stripped = rest.lstrip()
+            if stripped == "":
+                # Opener at a chunk boundary: wait for more data to decide.
+                self.pending = self.pending[i:]
+                return events
+            if not stripped.startswith("{"):
+                # Not a tool block: literal text.
+                events.append(("text", opener))
+                self.pending = rest
+                continue
+            self.body = {"buf": stripped, "scanned": 0, "depth": 0, "in_str": False, "esc": False}
+            self.pending = ""
+            events.extend(self._drain_body())
+        return events
+
+    def _drain_body(self) -> list:
+        events = []
+        b = self.body
+        buf = b["buf"]
+        i = b["scanned"]
+        n = len(buf)
+        while i < n:
+            c = buf[i]
+            if b["in_str"]:
+                if b["esc"]:
+                    b["esc"] = False
+                elif c == "\\":
+                    b["esc"] = True
+                elif c == '"':
+                    b["in_str"] = False
+            elif c == '"':
+                b["in_str"] = True
+            elif c == "{":
+                b["depth"] += 1
+            elif c == "}":
+                b["depth"] -= 1
+                if b["depth"] == 0:
+                    events.extend(self._emit_tool(buf[:i + 1]))
+                    self.body = None
+                    # Await the closing fence: it may arrive in a later chunk,
+                    # so delegate its consumption to _scan_text/_consume_fence.
+                    self.pending = buf[i + 1:]
+                    self.await_fence = True
+                    return events
+            i += 1
+        b["scanned"] = i
+        return events
+
+    def _emit_tool(self, json_str: str, depth: int = 0, in_str: bool = False) -> list:
+        try:
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                data = json.loads(_repair_json(json_str))
+        except (json.JSONDecodeError, ValueError):
+            if depth or in_str:
+                # Truncated mid-JSON: auto-close using the live scanner state.
+                closing = ('"' if in_str else "") + "}" * depth
+                try:
+                    data = json.loads(_repair_json(json_str + closing))
+                except (json.JSONDecodeError, ValueError):
+                    data = None
+            else:
+                data = None
+        if not isinstance(data, dict) or "name" not in data:
+            # Keep the raw block as text rather than dropping it silently.
+            opener = "```tool_call"
+            return [("text", opener + json_str + "```")]
+        args = data.get("arguments", data.get("args", {}))
+        args_json = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        idx = self.index
+        self.index += 1
+        return [("tool_start", idx, data["name"]), ("tool_args", idx, args_json), ("tool_end", idx)]
+
+
+# ─── Validation + transparent repair loop ────────────────────────────────────
+
+
+def generate_validated(
+    prompt: str,
+    tool_defs: list,
+    tool_choice,
+    generate_fn,
+    *gen_args,
+    parse_fn=None,
+    block_format: str = "tool_call",
+    **gen_kwargs,
+) -> tuple:
+    """Run generate_fn, parse tool calls and validate their arguments against
+    the tool schemas.
+
+    Invalid arguments trigger up to ``tool_validate_retry`` transparent repair
+    round-trips (the validation errors are fed back to the model together with
+    the original prompt). Returns (clean_text, tool_calls) in OpenAI shape.
+    """
+    if not tool_defs or tool_choice == "none":
+        return (generate_fn(prompt, *gen_args, **gen_kwargs) or "", [])
+    parse_fn = parse_fn or parse_tool_calls
+
+    def _round(p):
+        text = generate_fn(p, *gen_args, **gen_kwargs)
+        if not text:
+            return "", []
+        return parse_fn(text)
+
+    clean, calls = _round(prompt)
+    retries = int(CONFIG.get("tool_validate_retry", 1))
+    by_name = {d.get("name", ""): d for d in tool_defs}
+    attempt = 0
+    while calls and attempt < retries:
+        invalid = []
+        valid = []
+        for call in calls:
+            fn = call.get("function", {})
+            schema = (by_name.get(fn.get("name", ""), {}) or {}).get("parameters") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                invalid.append((call, f"{fn.get('name')}: arguments are not valid JSON"))
+                continue
+            errs = validate_tool_arguments(args, schema)
+            if errs:
+                invalid.append((call, f"{fn.get('name')}: " + "; ".join(errs)))
+            else:
+                valid.append(call)
+        if not invalid:
+            break
+        attempt += 1
+        from .gemini import log
+        log(f"Invalid tool arguments (repair round {attempt}): "
+            + "; ".join(msg for _, msg in invalid))
+        repair_prompt = (
+            f"{prompt}\n\n"
+            f"[System correction]: Your previous answer contained {block_format} blocks "
+            "with invalid arguments:\n"
+            + "".join(f"- {msg}\n" for _, msg in invalid)
+            + f"\nPrevious answer:\n{clean or ''}\n\n"
+            f"Re-output corrected {block_format} blocks ONLY, with arguments that satisfy "
+            "the tool schemas. If no tool call is needed, answer in plain text."
+        )
+        clean, calls = _round(repair_prompt)
+    # Keep only schema-valid calls; never hand broken arguments to the client.
+    final = []
+    for call in calls:
+        fn = call.get("function", {})
+        schema = (by_name.get(fn.get("name", ""), {}) or {}).get("parameters") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = None
+        if args is None or validate_tool_arguments(args, schema):
+            from .gemini import log
+            log(f"Dropping invalid tool call: {fn.get('name')}")
+            continue
+        final.append(call)
+    return clean, final

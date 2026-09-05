@@ -386,7 +386,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[-1][1]["response"]["status"], "completed")
         self.assertEqual(events[-1][1]["response"]["output"][0]["content"][0]["text"], "hello")
 
-    @mock.patch("gemini_web2api.server.parse_tool_calls")
+    @mock.patch("gemini_web2api.tools.parse_tool_calls")
     @mock.patch("gemini_web2api.server.generate", return_value="tool output")
     def test_responses_function_call_stream_has_complete_event_sequence(
         self, _generate, parse_tool_calls

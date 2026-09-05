@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
     "temporary_chats": False,
     "max_agent_turns": 8,
     "agent_tool_timeout_sec": 30,
+    "keepalive_url": None,
+    "keepalive_interval_sec": 600,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -1019,9 +1021,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 ]})
             elif self.path.startswith("/v1beta/models"):
                 self._handle_google_models_list()
-            elif self.path == "/":
+            elif self.path in ("/", "/health"):
                 self.send_json({"status": "ok", "version": __version__,
-                                "models": list(MODELS.keys())})
+                                 "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -1429,6 +1431,64 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+def _resolve_keepalive_target():
+    url = CONFIG.get("keepalive_url")
+    env_url = os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if not env_url:
+        hn = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+        if hn:
+            env_url = f"https://{hn}"
+    if env_url:
+        url = env_url
+    if not url or (isinstance(url, str) and url.strip().lower() in ("0", "false", "disabled", "off")):
+        return None, 0
+    url = str(url).strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    interval = CONFIG.get("keepalive_interval_sec", 600)
+    env_interval = os.environ.get("KEEPALIVE_INTERVAL_SEC") or os.environ.get("KEEPALIVE_INTERVAL")
+    if env_interval is not None:
+        try:
+            interval = int(str(env_interval).strip())
+        except ValueError:
+            pass
+    try:
+        interval = int(interval)
+    except (ValueError, TypeError):
+        interval = 600
+    if interval <= 0:
+        return None, 0
+    if interval > 840:
+        log(f"Keepalive: interval {interval}s trop grand, clamp à 600s")
+        interval = 600
+    return url.rstrip("/") + "/health", interval
+
+
+def _start_keepalive():
+    target, interval = _resolve_keepalive_target()
+    if not target:
+        log("Keepalive: désactivé (pas de KEEPALIVE_URL / RENDER_EXTERNAL_URL)")
+        return None, 0
+    import threading
+
+    def _loop():
+        time.sleep(10)
+        ctx = ssl.create_default_context()
+        log(f"Keepalive: actif -> {target} toutes les {interval}s")
+        while True:
+            time.sleep(interval)
+            try:
+                req = urllib.request.Request(target, headers={"User-Agent": "gemini-web2api-keepalive/1.0"})
+                with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+                    resp.read(1024)
+                log(f"Keepalive: ping OK {target} [{resp.status}]")
+            except Exception as e:
+                log(f"Keepalive: ping échoué {target}: {e}")
+
+    threading.Thread(target=_loop, daemon=True, name="render-keepalive").start()
+    return target, interval
+
+
 def load_config(path: str):
     if path and os.path.exists(path):
         with open(path) as f:
@@ -1460,6 +1520,21 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    if os.environ.get("PORT"):
+        try:
+            CONFIG["port"] = int(os.environ["PORT"])
+        except ValueError:
+            pass
+    if os.environ.get("KEEPALIVE_URL"):
+        CONFIG["keepalive_url"] = os.environ["KEEPALIVE_URL"]
+    if os.environ.get("KEEPALIVE_INTERVAL_SEC") or os.environ.get("KEEPALIVE_INTERVAL"):
+        try:
+            CONFIG["keepalive_interval_sec"] = int(os.environ.get("KEEPALIVE_INTERVAL_SEC") or os.environ.get("KEEPALIVE_INTERVAL"))
+        except ValueError:
+            pass
+    if not CONFIG.get("keepalive_url") and os.environ.get("RENDER_EXTERNAL_URL"):
+        CONFIG["keepalive_url"] = os.environ["RENDER_EXTERNAL_URL"]
+
     new_bl = fetch_latest_bl()
     if new_bl:
         CONFIG["gemini_bl"] = new_bl
@@ -1479,6 +1554,14 @@ def main():
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print(f"  BL:        {CONFIG['gemini_bl']}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
+    try:
+        ka_target, ka_interval = _start_keepalive()
+        if ka_target:
+            print(f"  Keepalive: {ka_target} toutes les {ka_interval}s")
+        else:
+            print(f"  Keepalive: désactivé (définis KEEPALIVE_URL ou RENDER_EXTERNAL_URL pour activer)")
+    except Exception as e:
+        print(f"  Keepalive: erreur init: {e}")
     print()
     try:
         server.serve_forever()

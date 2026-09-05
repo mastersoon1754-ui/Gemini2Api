@@ -16,5 +16,10 @@
   "log_requests": true,
   "temporary_chats": false,
   "max_agent_turns": 8,
-  "agent_tool_timeout_sec": 30
+  "agent_tool_timeout_sec": 30,
+  "tool_max_tools": 96,
+  "tool_max_prompt_chars": 120000,
+  "tool_validate_retry": 1,
+  "keepalive_url": null,
+  "keepalive_interval_sec": 600
 }

@@ -21,7 +21,7 @@ import ssl
 
 from .config import CONFIG
 from .gemini import generate, _get_ssl_ctx, log
-from .tools import messages_to_prompt, parse_tool_calls
+from .tools import messages_to_prompt, generate_validated, extract_openai_tool_defs
 
 
 def _parse_args(arguments):
@@ -94,17 +94,18 @@ def run_agent_loop(
     """
     max_turns = int(CONFIG.get("max_agent_turns", 8))
     tool_timeout = int(CONFIG.get("agent_tool_timeout_sec", 30))
+    tool_defs = extract_openai_tool_defs(tools) if tools and tool_choice != "none" else []
     history = list(messages)
     steps = []
     nudged = False
     last_text = ""
     for turn in range(max_turns):
         prompt, _ = messages_to_prompt(history, tools, tool_choice)
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text, calls = generate_validated(
+            prompt, tool_defs, tool_choice, generate,
+            model_id, think_mode, file_refs, extra_fields,
+        )
         last_text = text or ""
-        calls = []
-        if text and tools and tool_choice != "none":
-            text, calls = parse_tool_calls(text)
         if calls:
             history.append({"role": "assistant", "content": text or None, "tool_calls": calls})
             for call in calls:
