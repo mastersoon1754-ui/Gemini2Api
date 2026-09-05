@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "gemini-web2api/gemini-3.6-flash",
+  "small_model": "gemini-web2api/gemini-flash-lite",
+  "provider": {
+    "gemini-web2api": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Gemini Web2API",
+      "options": {
+        "baseURL": "http://127.0.0.1:8081/v1",
+        "apiKey": "sk-gemini"
+      },
+      "models": {
+        "gemini-3.7-flash": {
+          "name": "Gemini 3.7 Flash"
+        },
+        "gemini-3.6-flash": {
+          "name": "Gemini 3.6 Flash"
+        },
+        "gemini-3.5-flash": {
+          "name": "Gemini 3.5 Flash"
+        },
+        "gemini-3.5-flash-thinking": {
+          "name": "Gemini 3.5 Flash Thinking"
+        },
+        "gemini-3.5-flash-thinking-lite": {
+          "name": "Gemini 3.5 Flash Thinking Lite"
+        },
+        "gemini-3.1-pro": {
+          "name": "Gemini 3.1 Pro"
+        },
+        "gemini-3.1-pro-enhanced": {
+          "name": "Gemini 3.1 Pro Enhanced"
+        },
+        "gemini-auto": {
+          "name": "Gemini Auto"
+        },
+        "gemini-flash-lite": {
+          "name": "Gemini Flash Lite"
+        }
+      }
+    }
+  }
+}
