@@ -93,7 +93,14 @@ MODELS = {
     },
     "gemini-3.1-pro": {
         "mode": 3, "think": 4,
-        "desc": "Pro model (requires cookie for real routing)",
+        "desc": "Pro — requires Gemini Advanced cookie, otherwise same as Flash",
+        "requires_cookie": True,
+    },
+    "gemini-3.1-pro-enhanced": {
+        "mode": 3, "think": 4,
+        "desc": "Pro enhanced — requires cookie (experimental)",
+        "extra": {31: 2, 80: 3},
+        "requires_cookie": True,
     },
     "gemini-auto": {
         "mode": 4, "think": 4,
@@ -108,6 +115,30 @@ MODELS = {
         "desc": "Lightweight fast model",
     },
 }
+
+def _has_cookie() -> bool:
+    cf = CONFIG.get("cookie_file")
+    return bool(cf and os.path.exists(cf))
+
+def _available_models() -> dict:
+    if _has_cookie():
+        return dict(MODELS)
+    return {k: v for k, v in MODELS.items() if not v.get("requires_cookie")}
+
+def _resolve_model_monolith(model_name: str, default: str = "gemini-3.6-flash"):
+    # Strip @think for compat
+    if "@think=" in model_name:
+        model_name = model_name.split("@think=")[0]
+    cfg = MODELS.get(model_name)
+    if not cfg:
+        log(f"Unknown model '{model_name}', falling back to '{default}'")
+        model_name = default
+        cfg = MODELS[default]
+    if cfg.get("requires_cookie") and not _has_cookie():
+        log(f"Model '{model_name}' requires Gemini Advanced cookie — falling back to '{default}' (no fake Pro)")
+        model_name = default
+        cfg = MODELS[default]
+    return model_name, cfg["mode"], cfg.get("think", 4), cfg.get("extra")
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -1014,16 +1045,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             if self.path == "/v1/models":
+                avail = _available_models()
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
-                    for n, c in MODELS.items()
+                    for n, c in avail.items()
                 ]})
             elif self.path.startswith("/v1beta/models"):
                 self._handle_google_models_list()
             elif self.path in ("/", "/health"):
                 self.send_json({"status": "ok", "version": __version__,
-                                 "models": list(MODELS.keys())})
+                                 "models": list(_available_models().keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -1086,10 +1118,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
         think_override = None
         if "@think=" in model_name:
             model_name, think_str = model_name.rsplit("@think=", 1)
-            think_override = int(think_str)
+            try:
+                think_override = int(think_str)
+            except ValueError:
+                return None, None, None, f"Invalid think level: {think_str}"
         cfg = MODELS.get(model_name)
         if not cfg:
-            return None, None, None, f"Unknown model: {model_name}"
+            log(f"Unknown model '{model_name}', falling back to '{CONFIG['default_model']}'")
+            model_name = CONFIG["default_model"]
+            cfg = MODELS[model_name]
+        if cfg.get("requires_cookie") and not _has_cookie():
+            log(f"Model '{model_name}' requires Gemini Advanced cookie — falling back to '{CONFIG['default_model']}' (no fake Pro)")
+            model_name = CONFIG["default_model"]
+            cfg = MODELS[model_name]
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
@@ -1367,7 +1408,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _handle_google_models_list(self):
         """GET /v1beta/models — Google AI format model list."""
         models = []
-        for name, cfg in MODELS.items():
+        for name, cfg in _available_models().items():
             models.append({
                 "name": f"models/{name}",
                 "displayName": name,
