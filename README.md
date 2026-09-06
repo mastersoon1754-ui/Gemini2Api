@@ -120,7 +120,7 @@ Supports Google native API endpoints:
 | `gemini-auto` | Auto model selection | varies |
 | `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
 
-> **No fake Pro** : `gemini-3.1-pro` (et `pro-enhanced`) ne sont **pas exposés** sans `cookie_file` Gemini Advanced. En anonyme, `/v1/models` ne les liste pas et une requête vers `pro` retombe sur `gemini-3.6-flash` avec log `falling back to flash (no fake Pro)` — le backend Web ignore `MODE 3` sans abonnement payant.
+> **No fake Pro**: `gemini-3.1-pro` and `gemini-3.1-pro-enhanced` are **not exposed** without a valid `cookie_file` from a Gemini Advanced (paid) account. When running anonymously, `GET /v1/models` does not list them and any request to `gemini-3.1-pro` transparently falls back to `gemini-3.6-flash` with log `falling back to flash (no fake Pro)` — the Web backend ignores `MODE 3` without a paid subscription. With a valid cookie, both Pro variants are listed and routed correctly.
 
 ### Thinking Depth
 
@@ -422,9 +422,9 @@ Tool System (gemini_web2api/tools.py) — ```tool_call``` blocks, StreamToolCall
         ↓  tool_calls → Tool Executor (webhook or client) → [Tool result for ...] → next turn
 ```
 
-- **API Layer** ne connaît pas le détail Gemini (`bl`, `inner[79]`), seulement la traduction.
-- **Backend** ne connaît pas OpenAI (`tool_calls`, `finish_reason`), seulement `prompt` et `file_refs`.
-- **Tool System** est un fallback texte (` ```tool_call` ) avec abstraction `parse_fn`/`block_format` pour remplacer par un futur protocole natif si découvert (voir `docs/GEMINI_WEB_PROTOCOL.md`).
+- **API Layer** does not know Gemini internals (`bl`, `inner[79]`), only translation.
+- **Backend** does not know OpenAI concepts (`tool_calls`, `finish_reason`), only `prompt` and `file_refs`.
+- **Tool System** is a text fallback (` ```tool_call` ) with abstraction `parse_fn`/`block_format` to be replaced by a future native protocol if discovered (see `docs/GEMINI_WEB_PROTOCOL.md`).
 
 ## How It Works
 
