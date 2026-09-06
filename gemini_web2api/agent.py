@@ -77,6 +77,40 @@ def execute_tool_call(executor_url: str, call: dict, timeout: int = 30) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+def _execute_calls_parallel(calls: list, executor_url: str, timeout: int) -> list:
+    """Exécute plusieurs tool calls en parallèle (ThreadPool). Retourne list[str] results dans l'ordre.
+
+    Chaque call est indépendant ; une erreur/timeout d'un outil n'empêche pas les autres.
+    Utilise max_workers = min(len(calls), 8) pour limiter la pression.
+    """
+    if not calls:
+        return []
+    if len(calls) == 1:
+        try:
+            return [execute_tool_call(executor_url, calls[0], timeout=timeout)]
+        except Exception as e:
+            return [f"tool executor error: {e}"]
+
+    import concurrent.futures
+
+    results = [None] * len(calls)
+    max_workers = min(len(calls), 8)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {
+            pool.submit(execute_tool_call, executor_url, call, timeout): idx
+            for idx, call in enumerate(calls)
+        }
+        for fut in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as e:
+                # L'erreur est capturée comme résultat texte pour que Gemini puisse la voir et se corriger
+                results[idx] = f"tool executor error: {e}"
+                log(f"Tool {calls[idx]['function']['name']} failed: {e}")
+    return results
+
+
 def run_agent_loop(
     messages: list,
     tools: list,
@@ -91,6 +125,12 @@ def run_agent_loop(
 
     Returns (final_text, steps) where steps is a list of executed tool calls
     with their results, for observability.
+
+    Améliorations Phase 5 :
+    - appels parallèles quand un tour contient 2+ tool calls
+    - validation des arguments déjà faite via generate_validated
+    - timeout par outil, erreurs capturées comme résultats texte
+    - protection boucle infinie via max_agent_turns + détection de répétition ?
     """
     max_turns = int(CONFIG.get("max_agent_turns", 8))
     tool_timeout = int(CONFIG.get("agent_tool_timeout_sec", 30))
@@ -99,6 +139,8 @@ def run_agent_loop(
     steps = []
     nudged = False
     last_text = ""
+    # Petite protection contre boucle infinie : si le même tool est appelé avec les mêmes args 3 fois
+    seen_calls: dict = {}
     for turn in range(max_turns):
         prompt, _ = messages_to_prompt(history, tools, tool_choice)
         text, calls = generate_validated(
@@ -107,9 +149,22 @@ def run_agent_loop(
         )
         last_text = text or ""
         if calls:
-            history.append({"role": "assistant", "content": text or None, "tool_calls": calls})
+            # Détection boucle : même (name, args) répété trop souvent
             for call in calls:
-                result = execute_tool_call(executor_url, call, timeout=tool_timeout)
+                key = (call["function"]["name"], call["function"].get("arguments"))
+                seen_calls[key] = seen_calls.get(key, 0) + 1
+                if seen_calls[key] > 3:
+                    log(f"Agent loop: stopping duplicate call loop for {key}")
+                    return last_text, steps
+
+            history.append({"role": "assistant", "content": text or None, "tool_calls": calls})
+
+            # Exécution parallèle si plusieurs calls
+            if len(calls) > 1:
+                log(f"Agent loop turn {turn+1}: executing {len(calls)} tool calls in parallel")
+            results = _execute_calls_parallel(calls, executor_url, tool_timeout)
+
+            for call, result in zip(calls, results):
                 steps.append({
                     "name": call["function"]["name"],
                     "arguments": call["function"].get("arguments"),

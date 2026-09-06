@@ -31,6 +31,21 @@ python gemini_web2api.py
 
 Server starts at `http://localhost:8081/v1`.
 
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` , `/health` | Health check (no auth, <1KB, for keepalive) |
+| `GET` | `/v1/models` | List models (OpenAI) |
+| `POST` | `/v1/chat/completions` | Chat completions, `stream` SSE, `tools`, `tool_choice`, `tool_executor_url` (agent) |
+| `POST` | `/v1/responses` | Responses API (Codex) — same, `stream` events `response.*` |
+| `POST` | `/v1/messages` | Anthropic-compatible — `tools` with `input_schema`, `tool_choice` |
+| `GET` | `/v1beta/models` | List models (Google) |
+| `POST` | `/v1beta/models/{model}:generateContent` | Google non-streaming |
+| `POST` | `/v1beta/models/{model}:streamGenerateContent` | Google streaming SSE |
+
+All `/v1/*` respect `api_keys` (`Authorization: Bearer` or `x-api-key` or `?key=`). `/health` is always open.
+
 ## Client Configuration
 
 ### Cherry Studio / ChatBox / any OpenAI client
@@ -70,6 +85,15 @@ resp = client.chat.completions.create(
     messages=[{"role": "user", "content": "Explain quantum computing"}]
 )
 print(resp.choices[0].message.content)
+
+# Streaming (SSE compatible, tool_calls streamed as deltas)
+stream = client.chat.completions.create(
+    model="gemini-3.6-flash",
+    messages=[{"role": "user", "content": "Count to 5"}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="")
 ```
 
 ### Gemini CLI
@@ -380,11 +404,44 @@ resp = client.chat.completions.create(
 - `httpx` (`pip install httpx`) — used for streaming requests
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
+## Architecture
+
+```
+Client (OpenAI SDK / Codex / Gemini CLI / Anthropic)
+        ↓  POST /v1/chat/completions | /v1/responses | /v1/messages | /v1beta/*
+API Layer (gemini_web2api/server.py) — OpenAI / Google / Anthropic translation, SSE, auth, validation
+        ↓  prompt + tool_defs + images
+Orchestrator (gemini_web2api/orchestrator.py + agent.py) — prompt building, tool budget, validation, agent loop
+        ↓  prompt string + file_refs
+Gemini Web Backend (gemini_web2api/gemini.py) — f.req / bl / SAPISIDHASH / wrb.fr parsing / streaming
+        ↓  POST https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate
+Gemini Web
+        ↓  wrb.fr chunks
+Tool System (gemini_web2api/tools.py) — ```tool_call``` blocks, StreamToolCallParser, JSON Schema validation, repair loop
+        ↓  tool_calls → Tool Executor (webhook or client) → [Tool result for ...] → next turn
+```
+
+- **API Layer** ne connaît pas le détail Gemini (`bl`, `inner[79]`), seulement la traduction.
+- **Backend** ne connaît pas OpenAI (`tool_calls`, `finish_reason`), seulement `prompt` et `file_refs`.
+- **Tool System** est un fallback texte (` ```tool_call` ) avec abstraction `parse_fn`/`block_format` pour remplacer par un futur protocole natif si découvert (voir `docs/GEMINI_WEB_PROTOCOL.md`).
+
 ## How It Works
 
-This tool reverse-engineers Google Gemini's web StreamGenerate protocol. It sends requests to the same endpoint that the Gemini web app uses, converting between OpenAI's API format and Gemini's internal protobuf-like format.
+This project **does not use the official Google Gemini API** (`generativelanguage.googleapis.com`). It provides its **own OpenAI-compatible API** (`/v1/*`) and uses **Gemini Web as a backend**.
 
-The model selection is controlled by field `[79]` in the request payload, mapped from Gemini's frontend JavaScript source (`MODE_CATEGORY` enum).
+1. Your app calls `POST /v1/chat/completions` with OpenAI format (messages, tools, stream).
+2. The server (`server.py`) translates `messages` → a single prompt string (with `[System instruction]:`, `[Tool result for ...]:`) and `tools` → a JSON block injected in the prompt (`Available tools: [...]`). See `tools.py:207`.
+3. Images are uploaded via Scotty `content-push.googleapis.com` (`multimodal.py:88`) → `file_ref`.
+4. The backend (`gemini.py:195`) builds `inner[79]=MODE_CATEGORY` (1 FAST, 2 THINKING, 3 PRO, 4 AUTO... from `028-*.js`), `inner[17]=think`, `inner[41]=temporary_chats`, and POSTs `f.req` to `StreamGenerate?bl={bl}&_reqid={rand}&rt=c` with `SAPISIDHASH` if a cookie exists.
+5. Gemini Web streams `wrb.fr` lines (`)]}'` + `[[null,"wrb.fr",null,"<inner_json>"]]`). The proxy parses `inner[4]` for cumulative text and `inner[2]{"11","44"}` for end-of-generation, with a 60s idle fallback (`STALL_TIMEOUT`).
+6. If the model emitted ` ```tool_call\n{"name":...}\n``` ` blocks, `StreamToolCallParser` extracts them in real time, validates against JSON Schema, and (optionally) repairs via `generate_validated`. In agent mode (`tool_executor_url`), `agent.py` executes them (parallel) and loops.
+7. The API layer re-formats the result as OpenAI SSE (`choices[].delta.tool_calls`, `finish_reason: tool_calls`) / Google `functionCall` / Anthropic `tool_use`.
+
+Model selection is field `[79]` in the request payload, mapped from Gemini's frontend JS (`MODE_CATEGORY` enum). All tool calling is currently **simulated via prompt injection**, not a native Gemini Web field — see `REVERSE_ENGINEERING.md:14` and `docs/GEMINI_WEB_PROTOCOL.md:5` for levels `CONFIRMED`/`PROBABLE`/`UNKNOWN`.
+
+### Keepalive (Render free tier)
+
+Render sleeps free services after ~15 min without inbound traffic. The server self-pings `GET /health` every `keepalive_interval_sec` (default 600s) via `RENDER_EXTERNAL_URL` or `KEEPALIVE_URL` (`keepalive.py:1` + `__main__.py:36`). Set `KEEPALIVE_URL=https://your-app.onrender.com` or disable with `KEEPALIVE_INTERVAL_SEC=0`. Health endpoint is `GET /` and `GET /health` (no auth, <1KB).
 
 ## Acknowledgments
 

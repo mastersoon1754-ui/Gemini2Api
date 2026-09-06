@@ -18,38 +18,14 @@ from .tools import (
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from .agent import run_agent_loop
 from . import __version__
+# Orchestrator — séparation API / Backend / Tools (Phase 3)
+from . import orchestrator as _orch
 
-
-def _usage(prompt: str, text: str) -> dict:
-    p = len(prompt) // 4
-    c = len(text or "") // 4
-    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
-
-
-def _openai_tool_event_chunks(cid: str, created: int, model_name: str, event: tuple, call_ids: dict) -> list:
-    """Convert a StreamToolCallParser event into OpenAI streaming chunk dicts.
-
-    call_ids maps parser tool index -> generated call id (assigned on tool_start).
-    Returns a list (possibly empty) of chunk payloads.
-    """
-    kind = event[0]
-    base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name}
-    if kind == "text":
-        delta = {"content": event[1]}
-    elif kind == "tool_start":
-        _, idx, name = event
-        call_id = f"call_{uuid.uuid4().hex[:8]}"
-        call_ids[idx] = call_id
-        delta = {"tool_calls": [{"index": idx, "id": call_id, "type": "function",
-                                 "function": {"name": name, "arguments": ""}}]}
-    elif kind == "tool_args":
-        _, idx, args_json = event
-        delta = {"tool_calls": [{"index": idx, "function": {"arguments": args_json}}]}
-    else:  # tool_end: nothing to emit for OpenAI
-        return []
-    return [{**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}]
-
-
+# Alias vers orchestrator pour les helpers non mockés (tests ne touchent pas _usage)
+_usage = _orch.usage
+_openai_tool_event_chunks = _orch.openai_tool_events_to_chunks
+# _upload_images reste local pour que les tests mockant server.upload_image continuent de fonctionner.
+# orchestrator.upload_images existe en parallèle pour le nouveau code.
 def _upload_images(images: list) -> list:
     """Upload images and return list of file references. Returns None if no images."""
     if not images:
@@ -76,7 +52,14 @@ def _upload_images(images: list) -> list:
 class GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
-        log(f"{client_ip} {fmt % args}")
+        rid = getattr(self, "_request_id", "-")
+        log(f"{client_ip} [{rid}] {fmt % args}")
+
+    def _init_request_id(self):
+        # Respecte X-Request-Id client si fourni, sinon génère
+        rid = self.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex[:8]}"
+        self._request_id = rid
+        return rid
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -84,6 +67,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
+        if hasattr(self, "_request_id"):
+            self.send_header("X-Request-Id", self._request_id)
         self.end_headers()
         self.wfile.write(body)
 
@@ -92,6 +77,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if hasattr(self, "_request_id"):
+            self.send_header("X-Request-Id", self._request_id)
         self.end_headers()
 
     def _parse_body(self, body: bytes) -> dict:
@@ -153,6 +140,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        self._init_request_id()
         try:
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
@@ -179,6 +167,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        self._init_request_id()
         try:
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
