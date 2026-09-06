@@ -7,7 +7,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
-from .models import MODELS, resolve_model
+from .models import MODELS, resolve_model, available_models
 from .gemini import generate, generate_stream, log
 from .tools import (
     messages_to_prompt, parse_tool_calls, google_contents_to_prompt,
@@ -146,21 +146,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             if self.path == "/v1/models":
+                # N'expose que ce qui est réellement possible (pas de faux Pro sans cookie)
+                avail = available_models()
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
-                    for n, c in MODELS.items()
+                    for n, c in avail.items()
                 ]})
             elif self.path.startswith("/v1beta/models"):
+                avail = available_models()
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
-                    for n, c in MODELS.items()
+                    for n, c in avail.items()
                 ]})
             elif self.path in ("/", "/health"):
                 # /health est l'endpoint léger utilisé par le keepalive Render
                 # et les sondes UptimeRobot/cron. Pas d'auth, réponse < 1KB.
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({"status": "ok", "version": __version__, "models": list(available_models().keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):

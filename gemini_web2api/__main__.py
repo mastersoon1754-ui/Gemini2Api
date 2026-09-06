@@ -3,7 +3,7 @@ import argparse
 import os
 
 from .config import CONFIG, load_config, find_config
-from .models import MODELS
+from .models import MODELS, available_models
 from .gemini import HAS_HTTPX, fetch_latest_bl
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
@@ -59,8 +59,9 @@ def main():
     print(f"gemini-web2api v{__version__}")
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
-    print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    avail = available_models()
+    print(f"  Models:    {', '.join(avail.keys())}" + (f" (+{len(MODELS)-len(avail)} Pro hidden, no cookie)" if len(avail)!=len(MODELS) else ""))
+    print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous) — Pro hidden'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")

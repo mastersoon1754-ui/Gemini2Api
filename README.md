@@ -117,9 +117,10 @@ Supports Google native API endpoints:
 | `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
 | `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
 | `gemini-auto` | Auto model selection | varies |
 | `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
+
+> **No fake Pro** : `gemini-3.1-pro` (et `pro-enhanced`) ne sont **pas exposés** sans `cookie_file` Gemini Advanced. En anonyme, `/v1/models` ne les liste pas et une requête vers `pro` retombe sur `gemini-3.6-flash` avec log `falling back to flash (no fake Pro)` — le backend Web ignore `MODE 3` sans abonnement payant.
 
 ### Thinking Depth
 
